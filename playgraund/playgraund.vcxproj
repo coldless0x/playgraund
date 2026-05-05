@@ -136,12 +136,12 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
-    <ClCompile Include="syscall.cpp" />
+    <ClCompile Include="main.c" />
+    <ClCompile Include="syscall.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ntstructs.hpp" />
-    <ClInclude Include="syscall.hpp" />
+    <ClInclude Include="nt.h" />
+    <ClInclude Include="syscall.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

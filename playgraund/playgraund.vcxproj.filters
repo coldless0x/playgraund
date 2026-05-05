@@ -11,18 +11,18 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp">
+    <ClCompile Include="main.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="syscall.cpp">
+    <ClCompile Include="syscall.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ntstructs.hpp">
+    <ClInclude Include="nt.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="syscall.hpp">
+    <ClInclude Include="syscall.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
