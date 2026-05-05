@@ -14,23 +14,34 @@ static void InitializeUnicodeString(PUNICODE_STRING pUnicodeString, const wchar_
 
 int main()
 {
-    printf("\n[*] Initializing syscall stubs...\n");
+    printf("\n[DEBUG] Starting main...\n");
+    printf("[DEBUG] Calling syscall::Initialize()...\n");
 
     if (!syscall::Initialize())
     {
         printf("[-] Failed to resolve syscall numbers\n");
+        printf("[DEBUG] GetLastError: %lu\n", GetLastError());
         return 1;
     }
 
+    printf("[DEBUG] Initialize() succeeded\n");
     printf("[+] NtCreateUserProcess SSN: 0x%04X\n", syscall::g_SsnNtCreateUserProcess);
     printf("[+] NtClose SSN: 0x%04X\n\n", syscall::g_SsnNtClose);
 
+    if (syscall::g_SsnNtCreateUserProcess == 0 || syscall::g_SsnNtClose == 0)
+    {
+        printf("[-] Invalid SSN values\n");
+        return 1;
+    }
+
+    printf("[DEBUG] Getting ntdll handle...\n");
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (!hNtdll)
     {
         printf("[-] Failed to get ntdll handle\n");
         return 1;
     }
+    printf("[DEBUG] ntdll handle: %p\n", hNtdll);
 
     using FnRtlCreateProcessParametersEx = NTSTATUS(NTAPI*)(
         PRTL_USER_PROCESS_PARAMETERS*,
