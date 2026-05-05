@@ -2,6 +2,6 @@
   syscall.c
   Gerando código
   Previous IPDB not found, fall back to full compilation.
-  All 10 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  All 26 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
   Finalizada a geração de código
   playgraund.vcxproj -> C:\Users\kilij\source\repos\playgraund\x64\Release\playgraund.exe

@@ -1,22 +1,17 @@
 #pragma once
-#include "nt.h"
 
-extern WORD g_NtCreateUserProcess_SSN;
-extern WORD g_NtClose_SSN;
+#include <windows.h>
 
-BOOL InitSyscalls();
+extern WORD g_NtUserSendInput_SSN;
 
-NTSTATUS SysNtClose(HANDLE Handle);
+BOOL InitSyscalls(void);
 
-NTSTATUS SysNtCreateUserProcess(
-    PHANDLE                      ProcessHandle,
-    PHANDLE                      ThreadHandle,
-    ACCESS_MASK                  ProcessDesiredAccess,
-    ACCESS_MASK                  ThreadDesiredAccess,
-    POBJECT_ATTRIBUTES           ProcessObjectAttributes,
-    POBJECT_ATTRIBUTES           ThreadObjectAttributes,
-    ULONG                        ProcessFlags,
-    ULONG                        ThreadFlags,
-    PRTL_USER_PROCESS_PARAMETERS ProcessParameters,
-    PPS_CREATE_INFO              CreateInfo,
-    PPS_ATTRIBUTE_LIST           AttributeList);
+UINT SysNtUserSendInput(UINT cInputs, LPINPUT pInputs, int cbSize);
+
+PCWSTR Syscall_Win32uDiskPath(void);
+
+PVOID Syscall_StubArenaBase(void);
+
+SIZE_T Syscall_StubArenaSize(void);
+
+PVOID Syscall_NtUserSendInputTrampoline(void);
