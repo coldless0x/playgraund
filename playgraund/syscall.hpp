@@ -2,6 +2,7 @@
 
 #include "ntstructs.hpp"
 #include <cstring>
+#include <cwchar>
 
 namespace syscall {
 
@@ -10,167 +11,297 @@ inline WORD g_SsnNtClose = 0;
 
 namespace detail {
 
-inline WORD ResolveSSN(PBYTE pModuleBase, const char* pFunctionName)
+inline bool CanRead(const BYTE* pBase, SIZE_T cbMap, const void* p, SIZE_T cbNeed)
 {
-    if (!pModuleBase || !pFunctionName)
+    const auto pb = static_cast<const BYTE*>(p);
+    if (pb < pBase)
+        return false;
+    const SIZE_T off = static_cast<SIZE_T>(pb - pBase);
+    if (off + cbNeed < off)
+        return false;
+    return off + cbNeed <= cbMap;
+}
+
+// Parse a PE image mapped at pBase with cbMap bytes (file on disk or loaded module SizeOfImage).
+inline WORD ResolveSSN(const BYTE* pBase, SIZE_T cbMap, const char* pName)
+{
+    if (!pBase || !pName || cbMap < sizeof(IMAGE_DOS_HEADER))
         return 0;
 
-    auto pDosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(pModuleBase);
-    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+    auto pDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(pBase);
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE)
         return 0;
 
-    auto pNtHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(pModuleBase + pDosHeader->e_lfanew);
-    if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE)
+    const LONG e_lfanew = pDos->e_lfanew;
+    if (e_lfanew < 0)
+        return 0;
+    const SIZE_T ntOff = static_cast<SIZE_T>(e_lfanew);
+    if (ntOff + sizeof(IMAGE_NT_HEADERS64) > cbMap)
         return 0;
 
-    DWORD dwExportRva = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-    if (!dwExportRva)
+    auto pNt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(pBase + ntOff);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    if (pNt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
         return 0;
 
-    auto pExportDir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(pModuleBase + dwExportRva);
+    const DWORD expRva = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (expRva == 0)
+        return 0;
+    if (!CanRead(pBase, cbMap, pBase + expRva, sizeof(IMAGE_EXPORT_DIRECTORY)))
+        return 0;
 
-    auto pNames    = reinterpret_cast<PDWORD>(pModuleBase + pExportDir->AddressOfNames);
-    auto pOrdinals = reinterpret_cast<PWORD>(pModuleBase + pExportDir->AddressOfNameOrdinals);
-    auto pFuncs    = reinterpret_cast<PDWORD>(pModuleBase + pExportDir->AddressOfFunctions);
+    auto pExp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(pBase + expRva);
+    const DWORD nNames = pExp->NumberOfNames;
+    const DWORD nFuncs = pExp->NumberOfFunctions;
+    if (nNames == 0 || nFuncs == 0 || nNames > 0x100000u || nFuncs > 0x100000u)
+        return 0;
 
-    for (DWORD i = 0; i < pExportDir->NumberOfNames; ++i)
+    if (!CanRead(pBase, cbMap, pBase + pExp->AddressOfNames, static_cast<SIZE_T>(nNames) * sizeof(DWORD)))
+        return 0;
+    if (!CanRead(pBase, cbMap, pBase + pExp->AddressOfNameOrdinals, static_cast<SIZE_T>(nNames) * sizeof(WORD)))
+        return 0;
+    if (!CanRead(pBase, cbMap, pBase + pExp->AddressOfFunctions, static_cast<SIZE_T>(nFuncs) * sizeof(DWORD)))
+        return 0;
+
+    const auto pNameRvas = reinterpret_cast<const DWORD*>(pBase + pExp->AddressOfNames);
+    const auto pOrds = reinterpret_cast<const WORD*>(pBase + pExp->AddressOfNameOrdinals);
+    const auto pFuncRvas = reinterpret_cast<const DWORD*>(pBase + pExp->AddressOfFunctions);
+
+    for (DWORD i = 0; i < nNames; ++i)
     {
-        const char* pName = reinterpret_cast<const char*>(pModuleBase + pNames[i]);
-        if (strcmp(pName, pFunctionName) != 0)
+        const DWORD nameRva = pNameRvas[i];
+        if (nameRva == 0 || !CanRead(pBase, cbMap, pBase + nameRva, 1))
             continue;
 
-        PBYTE pFunc = pModuleBase + pFuncs[pOrdinals[i]];
+        SIZE_T nameMax = cbMap - static_cast<SIZE_T>(nameRva);
+        if (nameMax > 512)
+            nameMax = 512;
+        if (!CanRead(pBase, cbMap, pBase + nameRva, nameMax))
+            continue;
+
+        const char* exportName = reinterpret_cast<const char*>(pBase + nameRva);
+        bool terminated = false;
+        for (SIZE_T k = 0; k < nameMax; ++k)
+        {
+            if (exportName[k] == '\0')
+            {
+                terminated = true;
+                break;
+            }
+        }
+        if (!terminated)
+            continue;
+        if (strcmp(exportName, pName) != 0)
+            continue;
+
+        const WORD ord = pOrds[i];
+        if (ord >= nFuncs)
+            continue;
+
+        const DWORD funcRva = pFuncRvas[ord];
+        if (funcRva == 0 || !CanRead(pBase, cbMap, pBase + funcRva, 8))
+            continue;
+
+        const BYTE* pFunc = pBase + funcRva;
 
         if (pFunc[0] == 0x4C && pFunc[1] == 0x8B && pFunc[2] == 0xD1 && pFunc[3] == 0xB8)
-            return *reinterpret_cast<PWORD>(pFunc + 4);
+            return *reinterpret_cast<const WORD*>(pFunc + 4);
 
         if (pFunc[0] == 0xE9)
         {
-            for (int delta = 1; delta <= 32; ++delta)
+            for (int d = 1; d <= 32; ++d)
             {
-                PBYTE pUp = pFunc - delta * 32;
-                if (pUp >= pModuleBase && 
-                    pUp[0] == 0x4C && pUp[1] == 0x8B && pUp[2] == 0xD1 && pUp[3] == 0xB8)
-                    return static_cast<WORD>(*reinterpret_cast<PWORD>(pUp + 4) + delta);
+                const BYTE* up = pFunc - static_cast<SIZE_T>(d) * 32u;
+                if (CanRead(pBase, cbMap, up, 8) &&
+                    up[0] == 0x4C && up[1] == 0x8B && up[2] == 0xD1 && up[3] == 0xB8)
+                    return static_cast<WORD>(*reinterpret_cast<const WORD*>(up + 4) + d);
 
-                PBYTE pDown = pFunc + delta * 32;
-                if (pDown[0] == 0x4C && pDown[1] == 0x8B && pDown[2] == 0xD1 && pDown[3] == 0xB8)
-                    return static_cast<WORD>(*reinterpret_cast<PWORD>(pDown + 4) - delta);
+                const BYTE* dn = pFunc + static_cast<SIZE_T>(d) * 32u;
+                if (CanRead(pBase, cbMap, dn, 8) &&
+                    dn[0] == 0x4C && dn[1] == 0x8B && dn[2] == 0xD1 && dn[3] == 0xB8)
+                    return static_cast<WORD>(*reinterpret_cast<const WORD*>(dn + 4) - d);
             }
         }
-        break;
+        continue;
     }
     return 0;
 }
 
-inline PBYTE GenerateStub(WORD wSSN)
+inline PBYTE MakeStub(WORD ssn)
 {
-    static BYTE s_StubPool[64] = {};
-    static bool s_bInitialized = false;
-    static PBYTE s_pStubSlots[2] = { s_StubPool, s_StubPool + 32 };
-    static int s_SlotIndex = 0;
+    static PBYTE arena = nullptr;
+    static PBYTE slots[2] = {};
+    static int slot = 0;
 
-    if (!s_bInitialized)
+    if (!arena)
     {
-        DWORD dwOldProtect = 0;
-        VirtualProtect(s_StubPool, sizeof(s_StubPool), PAGE_EXECUTE_READWRITE, &dwOldProtect);
-        s_bInitialized = true;
+        SYSTEM_INFO si = {};
+        GetSystemInfo(&si);
+        const SIZE_T page = si.dwPageSize;
+        arena = static_cast<PBYTE>(VirtualAlloc(nullptr, page, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (!arena)
+            return nullptr;
+        slots[0] = arena;
+        slots[1] = arena + 32;
     }
 
-    PBYTE pStub = s_pStubSlots[s_SlotIndex];
-    s_SlotIndex = (s_SlotIndex + 1) % 2;
+    PBYTE stub = slots[slot];
+    slot = (slot + 1) % 2;
 
-    pStub[0]  = 0x4C;
-    pStub[1]  = 0x8B;
-    pStub[2]  = 0xD1;
-    pStub[3]  = 0xB8;
-    pStub[4]  = static_cast<BYTE>(wSSN & 0xFF);
-    pStub[5]  = static_cast<BYTE>((wSSN >> 8) & 0xFF);
-    pStub[6]  = 0x00;
-    pStub[7]  = 0x00;
-    pStub[8]  = 0x0F;
-    pStub[9]  = 0x05;
-    pStub[10] = 0xC3;
+    stub[0]  = 0x4C;
+    stub[1]  = 0x8B;
+    stub[2]  = 0xD1;
+    stub[3]  = 0xB8;
+    stub[4]  = static_cast<BYTE>(ssn & 0xFF);
+    stub[5]  = static_cast<BYTE>((ssn >> 8) & 0xFF);
+    stub[6]  = 0x00;
+    stub[7]  = 0x00;
+    stub[8]  = 0x0F;
+    stub[9]  = 0x05;
+    stub[10] = 0xC3;
 
-    FlushInstructionCache(GetCurrentProcess(), pStub, 11);
-    return pStub;
+    return stub;
+}
+
+inline bool ResolveFromMappedFile()
+{
+    wchar_t path[MAX_PATH] = {};
+    const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+    if (n == 0 || path[0] == L'\0')
+        return false;
+    if (wcscat_s(path, L"\\ntdll.dll") != 0)
+        return false;
+
+    HANDLE hFile = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER liSize = {};
+    if (!GetFileSizeEx(hFile, &liSize) || liSize.QuadPart <= 0)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+#if SIZE_MAX < UINT64_MAX
+    if (liSize.QuadPart > static_cast<LONGLONG>(SIZE_MAX))
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+#endif
+    const auto cbMap = static_cast<SIZE_T>(liSize.QuadPart);
+
+    HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!hMap)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    BYTE* pBase = static_cast<BYTE*>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
+    if (!pBase)
+    {
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return false;
+    }
+
+    g_SsnNtCreateUserProcess = ResolveSSN(pBase, cbMap, "NtCreateUserProcess");
+    g_SsnNtClose = ResolveSSN(pBase, cbMap, "NtClose");
+
+    UnmapViewOfFile(pBase);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+
+    return g_SsnNtCreateUserProcess != 0 && g_SsnNtClose != 0;
+}
+
+// Loaded image: use SizeOfImage so RVAs past raw file size (but present in memory) still parse.
+inline bool ResolveFromLoadedNtdll()
+{
+    HMODULE h = GetModuleHandleW(L"ntdll.dll");
+    if (!h)
+        return false;
+
+    BYTE* base = reinterpret_cast<BYTE*>(h);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0)
+        return false;
+
+    const SIZE_T ntOff = static_cast<SIZE_T>(dos->e_lfanew);
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + ntOff);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
+        return false;
+
+    const SIZE_T cb = nt->OptionalHeader.SizeOfImage;
+    if (cb < 0x2000 || ntOff + sizeof(IMAGE_NT_HEADERS64) > cb)
+        return false;
+
+    g_SsnNtCreateUserProcess = ResolveSSN(base, cb, "NtCreateUserProcess");
+    g_SsnNtClose = ResolveSSN(base, cb, "NtClose");
+    return g_SsnNtCreateUserProcess != 0 && g_SsnNtClose != 0;
 }
 
 } // namespace detail
 
 inline bool Initialize()
 {
-    wchar_t wszNtdllPath[MAX_PATH] = {};
-    if (!GetSystemDirectoryW(wszNtdllPath, MAX_PATH))
-        return false;
+    g_SsnNtCreateUserProcess = 0;
+    g_SsnNtClose = 0;
 
-    wcscat_s(wszNtdllPath, L"\\ntdll.dll");
-
-    HANDLE hFile = CreateFileW(wszNtdllPath, GENERIC_READ, FILE_SHARE_READ,
-                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE)
-        return false;
-
-    HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (!hMapping)
-    {
-        CloseHandle(hFile);
-        return false;
-    }
-
-    PBYTE pBase = static_cast<PBYTE>(MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0));
-    bool bSuccess = false;
-
-    if (pBase)
-    {
-        g_SsnNtCreateUserProcess = detail::ResolveSSN(pBase, "NtCreateUserProcess");
-        g_SsnNtClose = detail::ResolveSSN(pBase, "NtClose");
-        bSuccess = (g_SsnNtCreateUserProcess != 0 && g_SsnNtClose != 0);
-        UnmapViewOfFile(pBase);
-    }
-
-    CloseHandle(hMapping);
-    CloseHandle(hFile);
-    return bSuccess;
+#ifndef _WIN64
+    return false;
+#else
+    if (detail::ResolveFromMappedFile())
+        return true;
+    return detail::ResolveFromLoadedNtdll();
+#endif
 }
 
-inline NTSTATUS NtClose(HANDLE Handle)
+inline NTSTATUS NtClose(HANDLE h)
 {
-    using FnNtClose = NTSTATUS(NTAPI*)(HANDLE);
-    auto pfnNtClose = reinterpret_cast<FnNtClose>(detail::GenerateStub(g_SsnNtClose));
-    return pfnNtClose(Handle);
+    using Fn = NTSTATUS(NTAPI*)(HANDLE);
+    PBYTE stub = detail::MakeStub(g_SsnNtClose);
+    if (!stub)
+        return STATUS_UNSUCCESSFUL;
+    return reinterpret_cast<Fn>(stub)(h);
 }
 
 inline NTSTATUS NtCreateUserProcess(
-    PHANDLE                      ProcessHandle,
-    PHANDLE                      ThreadHandle,
-    ACCESS_MASK                  ProcessDesiredAccess,
-    ACCESS_MASK                  ThreadDesiredAccess,
-    POBJECT_ATTRIBUTES           ProcessObjectAttributes,
-    POBJECT_ATTRIBUTES           ThreadObjectAttributes,
-    ULONG                        ProcessFlags,
-    ULONG                        ThreadFlags,
-    PRTL_USER_PROCESS_PARAMETERS ProcessParameters,
-    PPS_CREATE_INFO              CreateInfo,
-    PPS_ATTRIBUTE_LIST           AttributeList)
+    PHANDLE hProc,
+    PHANDLE hThread,
+    ACCESS_MASK procAccess,
+    ACCESS_MASK threadAccess,
+    POBJECT_ATTRIBUTES procAttr,
+    POBJECT_ATTRIBUTES threadAttr,
+    ULONG procFlags,
+    ULONG threadFlags,
+    PRTL_USER_PROCESS_PARAMETERS params,
+    PPS_CREATE_INFO info,
+    PPS_ATTRIBUTE_LIST attrs)
 {
-    using FnNtCreateUserProcess = NTSTATUS(NTAPI*)(
+    using Fn = NTSTATUS(NTAPI*)(
         PHANDLE, PHANDLE, ACCESS_MASK, ACCESS_MASK,
         POBJECT_ATTRIBUTES, POBJECT_ATTRIBUTES,
         ULONG, ULONG,
         PRTL_USER_PROCESS_PARAMETERS,
-        PPS_CREATE_INFO,
-        PPS_ATTRIBUTE_LIST);
+        PPS_CREATE_INFO, PPS_ATTRIBUTE_LIST);
 
-    auto pfnNtCreateUserProcess = reinterpret_cast<FnNtCreateUserProcess>(
-        detail::GenerateStub(g_SsnNtCreateUserProcess));
-
-    return pfnNtCreateUserProcess(
-        ProcessHandle, ThreadHandle,
-        ProcessDesiredAccess, ThreadDesiredAccess,
-        ProcessObjectAttributes, ThreadObjectAttributes,
-        ProcessFlags, ThreadFlags,
-        ProcessParameters, CreateInfo, AttributeList);
+    PBYTE stub = detail::MakeStub(g_SsnNtCreateUserProcess);
+    if (!stub)
+        return STATUS_UNSUCCESSFUL;
+    return reinterpret_cast<Fn>(stub)(
+        hProc, hThread, procAccess, threadAccess,
+        procAttr, threadAttr, procFlags, threadFlags,
+        params, info, attrs);
 }
 
 } // namespace syscall

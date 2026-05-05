@@ -1,165 +1,135 @@
 #include "syscall.hpp"
 #include <cstdio>
+#include <cwchar>
 
-static void InitializeUnicodeString(PUNICODE_STRING pUnicodeString, const wchar_t* pwszSource)
+static void InitUS(UNICODE_STRING* us, const wchar_t* s)
 {
-    pUnicodeString->Buffer = const_cast<wchar_t*>(pwszSource);
-    pUnicodeString->Length = static_cast<USHORT>(wcslen(pwszSource) * sizeof(wchar_t));
-    pUnicodeString->MaximumLength = pUnicodeString->Length + sizeof(wchar_t);
+    us->Buffer = const_cast<wchar_t*>(s);
+    us->Length = static_cast<USHORT>(wcslen(s) * sizeof(wchar_t));
+    us->MaximumLength = static_cast<USHORT>(us->Length + sizeof(wchar_t));
 }
 
 int main()
 {
-    printf("\n[*] Starting...\n");
+#ifndef _WIN64
+    printf("\n[-] This tool must be built as x64 (Configuration Manager -> Platform: x64).\n");
+    printf("    Win32 builds cannot use x64 syscall stubs.\n\n");
+    return 1;
+#endif
 
-    printf("[*] Initializing syscall stubs...\n");
+    printf("\n[*] Initializing syscalls...\n");
+    fflush(stdout);
 
     if (!syscall::Initialize())
     {
-        printf("[-] Failed to resolve syscall numbers\n");
+        printf("[-] Failed to resolve SSNs from ntdll (disk + loaded image).\n");
+        printf("    Use an x64 build and run on 64-bit Windows.\n\n");
         return 1;
     }
 
-    printf("[+] NtCreateUserProcess SSN: 0x%04X\n", syscall::g_SsnNtCreateUserProcess);
-    printf("[+] NtClose SSN: 0x%04X\n\n", syscall::g_SsnNtClose);
+    printf("[+] NtCreateUserProcess: 0x%04X\n", syscall::g_SsnNtCreateUserProcess);
+    printf("[+] NtClose: 0x%04X\n\n", syscall::g_SsnNtClose);
 
-    if (syscall::g_SsnNtCreateUserProcess == 0 || syscall::g_SsnNtClose == 0)
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
     {
-        printf("[-] Invalid SSN values\n");
+        printf("[-] GetModuleHandleW(ntdll) failed\n");
         return 1;
     }
 
-    printf("[*] Getting ntdll handle...\n");
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    if (!hNtdll)
+    using RtlCreateProcParams_t = NTSTATUS(NTAPI*)(
+        PRTL_USER_PROCESS_PARAMETERS*, PUNICODE_STRING, PUNICODE_STRING,
+        PUNICODE_STRING, PUNICODE_STRING, PVOID,
+        PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING, PUNICODE_STRING, ULONG);
+
+    auto RtlCreateProcParams = reinterpret_cast<RtlCreateProcParams_t>(
+        GetProcAddress(ntdll, "RtlCreateProcessParametersEx"));
+    using RtlDestroyProcParams_t = NTSTATUS(NTAPI*)(PRTL_USER_PROCESS_PARAMETERS);
+    auto RtlDestroyProcParams = reinterpret_cast<RtlDestroyProcParams_t>(
+        GetProcAddress(ntdll, "RtlDestroyProcessParameters"));
+
+    if (!RtlCreateProcParams)
     {
-        printf("[-] Failed to get ntdll handle\n");
+        printf("[-] RtlCreateProcessParametersEx not found\n");
         return 1;
     }
-    printf("[+] ntdll handle: 0x%p\n", hNtdll);
 
-    using FnRtlCreateProcessParametersEx = NTSTATUS(NTAPI*)(
-        PRTL_USER_PROCESS_PARAMETERS*,
-        PUNICODE_STRING,
-        PUNICODE_STRING,
-        PUNICODE_STRING,
-        PUNICODE_STRING,
-        PVOID,
-        PUNICODE_STRING,
-        PUNICODE_STRING,
-        PUNICODE_STRING,
-        PUNICODE_STRING,
-        ULONG);
+    UNICODE_STRING img = {};
+    UNICODE_STRING dir = {};
+    UNICODE_STRING cmd = {};
+    InitUS(&img, L"\\??\\C:\\Windows\\System32\\notepad.exe");
+    InitUS(&dir, L"C:\\Windows\\System32\\");
+    InitUS(&cmd, L"notepad.exe");
 
-    printf("[*] Resolving RtlCreateProcessParametersEx...\n");
-    auto pfnRtlCreateProcessParametersEx = reinterpret_cast<FnRtlCreateProcessParametersEx>(
-        GetProcAddress(hNtdll, "RtlCreateProcessParametersEx"));
-
-    if (!pfnRtlCreateProcessParametersEx)
-    {
-        printf("[-] Failed to resolve RtlCreateProcessParametersEx\n");
-        return 1;
-    }
-    printf("[+] RtlCreateProcessParametersEx resolved\n");
-
-    const wchar_t* pwszImagePath = L"\\??\\C:\\Windows\\System32\\notepad.exe";
-    const wchar_t* pwszCurrentDirectory = L"C:\\Windows\\System32\\";
-    const wchar_t* pwszCommandLine = L"notepad.exe";
-
-    UNICODE_STRING usImagePath = {};
-    UNICODE_STRING usCurrentDirectory = {};
-    UNICODE_STRING usCommandLine = {};
-
-    InitializeUnicodeString(&usImagePath, pwszImagePath);
-    InitializeUnicodeString(&usCurrentDirectory, pwszCurrentDirectory);
-    InitializeUnicodeString(&usCommandLine, pwszCommandLine);
-
-    PRTL_USER_PROCESS_PARAMETERS pProcessParameters = nullptr;
-    NTSTATUS status = pfnRtlCreateProcessParametersEx(
-        &pProcessParameters,
-        &usImagePath,
-        nullptr,
-        &usCurrentDirectory,
-        &usCommandLine,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
+    PRTL_USER_PROCESS_PARAMETERS params = nullptr;
+    NTSTATUS st = RtlCreateProcParams(
+        &params, &img, nullptr, &dir, &cmd,
+        nullptr, nullptr, nullptr, nullptr, nullptr,
         RTL_USER_PROC_PARAMS_NORMALIZED);
 
-    if (!NT_SUCCESS(status))
+    if (!NT_SUCCESS(st))
     {
-        printf("[-] RtlCreateProcessParametersEx failed: 0x%08X\n", status);
+        printf("[-] RtlCreateProcessParametersEx failed: 0x%08X\n", static_cast<unsigned>(st));
         return 1;
     }
 
     printf("[+] Process parameters created\n");
 
-    PS_CREATE_INFO createInfo = {};
-    createInfo.Size = sizeof(PS_CREATE_INFO);
-    createInfo.State = PsCreateInitialState;
+    PS_CREATE_INFO ci = {};
+    ci.Size = sizeof(ci);
+    ci.State = PsCreateInitialState;
 
-    PS_ATTRIBUTE_LIST attributeList = {};
-    attributeList.TotalLength = sizeof(PS_ATTRIBUTE_LIST);
-    attributeList.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
-    attributeList.Attributes[0].Size = usImagePath.Length;
-    attributeList.Attributes[0].Value = reinterpret_cast<ULONG_PTR>(usImagePath.Buffer);
-    attributeList.Attributes[0].ReturnLength = nullptr;
+    PS_ATTRIBUTE_LIST al = {};
+    al.TotalLength = sizeof(al);
+    al.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+    al.Attributes[0].Size = img.Length;
+    al.Attributes[0].Value = reinterpret_cast<ULONG_PTR>(img.Buffer);
+    al.Attributes[0].ReturnLength = nullptr;
 
-    HANDLE hProcess = nullptr;
+    HANDLE hProc = nullptr;
     HANDLE hThread = nullptr;
 
-    printf("[*] Invoking NtCreateUserProcess...\n");
+    printf("[*] Calling NtCreateUserProcess...\n");
+    fflush(stdout);
 
-    status = syscall::NtCreateUserProcess(
-        &hProcess,
-        &hThread,
-        PROCESS_ALL_ACCESS,
-        THREAD_ALL_ACCESS,
-        nullptr,
-        nullptr,
-        0,
-        0,
-        pProcessParameters,
-        &createInfo,
-        &attributeList);
+    st = syscall::NtCreateUserProcess(
+        &hProc, &hThread,
+        PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
+        nullptr, nullptr, 0, 0,
+        params, &ci, &al);
 
-    if (!NT_SUCCESS(status))
+    if (RtlDestroyProcParams && params)
+        RtlDestroyProcParams(params);
+
+    if (!NT_SUCCESS(st))
     {
-        printf("[-] NtCreateUserProcess failed: 0x%08X\n", status);
+        printf("[-] NtCreateUserProcess failed: 0x%08X\n", static_cast<unsigned>(st));
         return 1;
     }
 
-    using FnNtQueryInformationProcess = NTSTATUS(NTAPI*)(
-        HANDLE,
-        PROCESSINFOCLASS,
-        PVOID,
-        ULONG,
-        PULONG);
-
-    auto pfnNtQueryInformationProcess = reinterpret_cast<FnNtQueryInformationProcess>(
-        GetProcAddress(hNtdll, "NtQueryInformationProcess"));
+    using NtQueryInfo_t = NTSTATUS(NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+    auto NtQueryInfo = reinterpret_cast<NtQueryInfo_t>(
+        GetProcAddress(ntdll, "NtQueryInformationProcess"));
 
     PROCESS_BASIC_INFORMATION pbi = {};
-    if (pfnNtQueryInformationProcess)
+    if (NtQueryInfo)
     {
-        pfnNtQueryInformationProcess(
-            hProcess,
+        NtQueryInfo(
+            hProc,
             ProcessBasicInformation,
             &pbi,
-            sizeof(PROCESS_BASIC_INFORMATION),
+            sizeof(pbi),
             nullptr);
     }
 
-    printf("[+] Process created successfully\n");
+    printf("[+] notepad.exe spawned\n");
     printf("[+] PID: %llu\n", static_cast<unsigned long long>(pbi.UniqueProcessId));
-    printf("[+] Process handle: 0x%p\n", hProcess);
-    printf("[+] Thread handle: 0x%p\n\n", hThread);
+    printf("[+] hProcess: %p\n", hProc);
+    printf("[+] hThread: %p\n\n", hThread);
 
     syscall::NtClose(hThread);
-    syscall::NtClose(hProcess);
+    syscall::NtClose(hProc);
 
-    printf("[+] Handles closed\n\n");
+    printf("[+] Done\n\n");
     return 0;
 }

@@ -8,6 +8,10 @@ typedef LONG NTSTATUS;
 #define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
 #define NTAPI __stdcall
 
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+#endif
+
 typedef struct _UNICODE_STRING {
     USHORT Length;
     USHORT MaximumLength;
