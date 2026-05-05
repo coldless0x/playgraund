@@ -187,6 +187,27 @@ typedef enum _PS_ATTRIBUTE_NUM {
 #define PS_ATTRIBUTE_IMAGE_NAME \
     PsAttributeValue(PsAttributeImageName, FALSE, TRUE, FALSE)
 
+#define PS_ATTRIBUTE_STD_HANDLE_INFO \
+    PsAttributeValue(PsAttributeStdHandleInfo, FALSE, TRUE, FALSE)
+
+typedef enum _PS_STD_HANDLE_STATE {
+    PsNeverDuplicate,
+    PsRequestDuplicate,
+    PsAlwaysDuplicate,
+    PsMaxStdHandleStates
+} PS_STD_HANDLE_STATE;
+
+typedef struct _PS_STD_HANDLE_INFO {
+    union {
+        ULONG Flags;
+        struct {
+            ULONG StdHandleState : 2;
+            ULONG PseudoHandleMask : 3;
+        };
+    };
+    ULONG StdHandleSubsystemType;
+} PS_STD_HANDLE_INFO, *PPS_STD_HANDLE_INFO;
+
 typedef struct _PS_ATTRIBUTE {
     ULONG_PTR Attribute;
     SIZE_T    Size;
